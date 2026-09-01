@@ -1,9 +1,10 @@
 name: Proxy Tester
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'  # Runs every 6 hours
   workflow_dispatch:        # Allows manual trigger
+
+permissions:
+  contents: write  # Grant write permissions to the repository
 
 jobs:
   test-proxies:
@@ -12,7 +13,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
       - name: Create test script
         run: |
           cat > test_proxies.py << 'EOF'
@@ -22,15 +25,33 @@ jobs:
           import requests
           import time
           import json
-          import subprocess
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from datetime import datetime
           import urllib.parse
           import sys
+          import os
+          import glob
+
+          def find_proxy_file():
+              """Find the proxy list file (list.txt or socks5*.txt)"""
+              # Check for list.txt first
+              if os.path.exists('list.txt'):
+                  return 'list.txt'
+              
+              # Check for socks5*.txt files
+              sock_files = glob.glob('socks5*.txt')
+              if sock_files:
+                  return sock_files[0]
+              
+              return None
 
           def parse_proxy(proxy_string):
               """Parse various proxy formats and return standardized URL"""
               proxy_string = proxy_string.strip()
+              
+              # Skip empty lines and comments
+              if not proxy_string or proxy_string.startswith('#'):
+                  return None
               
               # Check if already has protocol
               if not proxy_string.startswith(('socks5://', 'socks://', 'http://', 'https://')):
@@ -145,29 +166,47 @@ jobs:
                   return None
 
           def main():
-              # Read proxies from list.txt
+              # Find the proxy file
+              proxy_file = find_proxy_file()
+              if not proxy_file:
+                  print("Error: No proxy file found (list.txt or socks5*.txt)")
+                  print("Please create list.txt with your proxies")
+                  sys.exit(1)
+              
+              print(f"Using proxy file: {proxy_file}")
+              
+              # Read proxies from file
               try:
-                  with open('list.txt', 'r') as f:
+                  with open(proxy_file, 'r') as f:
                       proxies = [line.strip() for line in f if line.strip()]
               except FileNotFoundError:
-                  print("Error: list.txt not found")
+                  print(f"Error: {proxy_file} not found")
                   sys.exit(1)
               
               if not proxies:
-                  print("No proxies found in list.txt")
+                  print("No proxies found in file")
                   sys.exit(1)
               
               print(f"Testing {len(proxies)} proxies...")
+              print("-" * 60)
               
               # Test proxies in parallel
               results = []
               with ThreadPoolExecutor(max_workers=20) as executor:
                   future_to_proxy = {executor.submit(test_proxy, proxy): proxy for proxy in proxies}
+                  completed = 0
                   for future in as_completed(future_to_proxy):
+                      completed += 1
                       result = future.result()
                       if result:
                           results.append(result)
                           print(f"✓ {result['proxy']} - {result['location']} - {result['latency']}ms - {result['speed']}MB/s")
+                      else:
+                          print(f"✗ {future_to_proxy[future]} - Failed")
+                      
+                      # Show progress
+                      if completed % 10 == 0:
+                          print(f"Progress: {completed}/{len(proxies)}")
               
               # Sort by speed (highest first) then by latency (lowest first)
               results.sort(key=lambda x: (-x['speed'], x['latency']))
@@ -181,8 +220,15 @@ jobs:
                   for result in results:
                       f.write(f"{result['proxy']}#{result['location']} {result['latency']}ms {result['speed']}MB/s\n")
               
-              print(f"\nResults written to {output_file}")
-              print(f"Found {len(results)} working proxies out of {len(proxies)}")
+              print("-" * 60)
+              print(f"✓ Results written to {output_file}")
+              print(f"✓ Found {len(results)} working proxies out of {len(proxies)}")
+              
+              # Print top 5 proxies
+              if results:
+                  print("\n🏆 Top 5 Proxies:")
+                  for i, result in enumerate(results[:5], 1):
+                      print(f"{i}. {result['proxy']} - {result['location']} - {result['latency']}ms - {result['speed']}MB/s")
 
           if __name__ == "__main__":
               main()
@@ -193,9 +239,10 @@ jobs:
         run: |
           pip install requests
           
-      - name: Create sample list.txt if not exists
+      - name: Check for proxy file
         run: |
-          if [ ! -f list.txt ]; then
+          if [ ! -f list.txt ] && [ ! -f socks5*.txt ]; then
+            echo "No proxy file found. Creating sample list.txt..."
             cat > list.txt << 'EOF'
           socks5://208.102.51.6:58208
           69.61.200.104:36181
@@ -212,12 +259,12 @@ jobs:
           name: proxy-results
           path: output-*.txt
           
-      - name: Commit and push results (optional)
+      - name: Commit and push results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output-*.txt
+          git add output-*.txt || echo "No output files to add"
           git commit -m "Add proxy test results $(date +'%Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
-          git push
+          git push || echo "Push failed - check permissions"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
